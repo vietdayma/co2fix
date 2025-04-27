@@ -52,12 +52,13 @@ def get_session():
     """
     session = requests.Session()
     retry = Retry(
-        total=5,  # Tăng số lần thử lại tối đa
-        backoff_factor=0.2,  # Giảm thời gian giữa các lần retry để tăng tốc
-        status_forcelist=[429, 500, 502, 503, 504],  # Mã HTTP cần thử lại
-        allowed_methods=["GET", "POST"]  # Các phương thức được phép thử lại
+        total=8,  # Tăng số lần thử lại tối đa lên 8
+        backoff_factor=0.5,  # Tăng backoff_factor để đợi lâu hơn giữa các lần retry
+        status_forcelist=[429, 500, 502, 503, 504, 520, 521, 522, 524],  # Thêm mã lỗi Cloudflare
+        allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"],  # Mở rộng các phương thức được phép
+        respect_retry_after_header=True  # Tôn trọng header Retry-After từ server
     )
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -110,7 +111,7 @@ def predict_with_api(features):
     # Cơ chế dự phòng khi không thể gửi request
     try:
         # Sử dụng semaphore để giới hạn số request đồng thời
-        acquired = api_semaphore.acquire(timeout=0.5)  # Timeout nếu không thể acquire trong 0.5s
+        acquired = api_semaphore.acquire(timeout=2.0)  # Tăng timeout lên 2.0s
         if not acquired:
             # Nếu không thể lấy semaphore, trả về giá trị mặc định
             return {
@@ -122,23 +123,32 @@ def predict_with_api(features):
             
         try:
             # Thêm độ trễ ngẫu nhiên nhỏ để tránh gửi đồng loạt request
-            time.sleep(random.uniform(0.01, 0.1))  # Giảm delay ngẫu nhiên
+            time.sleep(random.uniform(0.01, 0.05))  # Giảm delay ngẫu nhiên xuống 
             
             # Kiểm tra chế độ benchmark để chọn endpoint phù hợp
             benchmark_mode = os.environ.get('BENCHMARK_MODE', 'false').lower() == 'true'
             
             # Thực hiện request đến API
-            session = get_session()
+            session = get_session()  # Sử dụng phiên có retry
             api_url = os.environ.get('API_URL')
+            
+            # Tăng timeout cho API call
+            api_timeout = 15.0  # Tăng từ 2s lên 15s để xử lý cold start
+            
+            # Thêm header để tracking
+            headers = {
+                'X-Client-Source': 'streamlit-app',
+                'X-Request-ID': f"req-{int(time.time() * 1000)}"
+            }
             
             if benchmark_mode:
                 # Sử dụng endpoint fallback đơn giản cho benchmark
                 api_url = api_url + "/fallback"
-                response = session.post(api_url, json={}, timeout=2)
+                response = session.post(api_url, json={}, timeout=api_timeout, headers=headers)
             else:
                 # Sử dụng endpoint dự đoán thực tế
                 api_url = api_url + "/predict"
-                response = session.post(api_url, json=features, timeout=2)
+                response = session.post(api_url, json=features, timeout=api_timeout, headers=headers)
                 
             response.raise_for_status()
             result = response.json()
@@ -150,15 +160,23 @@ def predict_with_api(features):
             
             return result
         except requests.exceptions.Timeout:
-            # Xử lý lỗi timeout - trả về giá trị mặc định
+            # Xử lý lỗi timeout - trả về giá trị mặc định với thông báo rõ ràng hơn
             return {
                 'prediction': DEFAULT_PREDICTION,
                 'process_time_ms': 5.0,
                 'status': 'fallback',
-                'message': 'API timeout'
+                'message': 'API timeout - server có thể đang quá tải hoặc đang khởi động'
+            }
+        except requests.exceptions.ConnectionError:
+            # Xử lý lỗi kết nối
+            return {
+                'prediction': DEFAULT_PREDICTION,
+                'process_time_ms': 5.0,
+                'status': 'fallback',
+                'message': 'Không thể kết nối đến API server'
             }
         except requests.exceptions.RequestException as e:
-            # Xử lý các lỗi request khác - trả về giá trị mặc định
+            # Xử lý các lỗi request khác
             return {
                 'prediction': DEFAULT_PREDICTION,
                 'process_time_ms': 5.0,
@@ -194,39 +212,77 @@ def check_api_health():
     status_placeholder = st.empty()
     status_placeholder.info("Đang kết nối đến API server...")
     
-    try:
-        # Sử dụng phiên với cơ chế thử lại
-        session = get_session()
-        response = session.get(f"{api_url}/health", timeout=10)  # Giảm timeout xuống 10s
-        
-        if response.status_code == 200:
-            status_placeholder.success(f"Đã kết nối đến API server tại {api_url}")
-            return True
-        else:
-            # Xử lý khi API đang khởi tạo (không phải lỗi)
-            status = response.json().get("status", "") if response.content else "unknown"
-            message = response.json().get("message", "") if response.content else "No response"
+    # Tạo session riêng cho health check với timeout dài hơn
+    session = get_session()
+    max_retries = 3  # Số lần thử lại tối đa
+    
+    for retry_count in range(max_retries):
+        try:
+            # Tăng timeout lên để xử lý cold start
+            response = session.get(f"{api_url}/health", timeout=30)
             
-            # Chờ tối đa 20 giây (giảm từ 60s)
-            for i in range(20):
-                status_placeholder.warning(f"API server đang khởi tạo... Vui lòng đợi ({i+1}/20s)")
-                time.sleep(1)
+            if response.status_code == 200:
+                status_data = response.json()
+                status = status_data.get("status", "")
                 
-                try:
-                    response = session.get(f"{api_url}/health", timeout=3)
-                    if response.status_code == 200 and response.json().get("status") == "healthy":
-                        status_placeholder.success(f"Đã kết nối đến API server tại {api_url}")
+                if status == "healthy":
+                    status_placeholder.success(f"✅ Đã kết nối đến API server tại {api_url}")
+                    return True
+                elif status == "initializing":
+                    # API đang khởi tạo - đợi và thử lại
+                    for i in range(20):  # Đợi tối đa 20 giây
+                        status_placeholder.warning(f"⏳ API server đang khởi tạo... Vui lòng đợi ({i+1}/20s)")
+                        time.sleep(1)
+                        
+                        try:
+                            init_response = session.get(f"{api_url}/health", timeout=5)
+                            if init_response.status_code == 200 and init_response.json().get("status") == "healthy":
+                                status_placeholder.success(f"✅ API server đã sẵn sàng!")
+                                return True
+                        except requests.exceptions.RequestException:
+                            pass
+                    
+                    # Nếu không thành công sau khi chờ đợi, thử lại từ đầu (nếu còn lần thử)
+                    if retry_count < max_retries - 1:
+                        status_placeholder.info(f"🔄 Đang thử kết nối lại ({retry_count + 2}/{max_retries})...")
+                    else:
+                        status_placeholder.warning(f"⚠️ API server vẫn đang khởi tạo sau nhiều lần thử. Tiếp tục với dự đoán local.")
                         return True
-                except requests.exceptions.RequestException:
-                    pass
-            
-            # Sau khi hết thời gian chờ, vẫn tiếp tục với mô hình local
-            status_placeholder.error(f"API server có vấn đề: {message}. Tiếp tục với dự đoán local.")
-            return True  # Vẫn trả về True để tiếp tục
-    except requests.exceptions.RequestException as e:
-        status_placeholder.error(f"Không thể kết nối đến API server tại {api_url}: {str(e)}")
-        # Tiếp tục mà không có API - sẽ sử dụng mô hình local
-        return True
+                else:
+                    # Trạng thái không mong muốn
+                    status_placeholder.warning(f"⚠️ API server trả về trạng thái không mong muốn: {status}")
+                    return True
+            else:
+                if retry_count < max_retries - 1:
+                    status_placeholder.info(f"🔄 Mã phản hồi không mong muốn ({response.status_code}). Đang thử lại ({retry_count + 2}/{max_retries})...")
+                    time.sleep(2)  # Đợi 2 giây trước khi thử lại
+                else:
+                    status_placeholder.error(f"❌ API server trả về mã lỗi: {response.status_code}")
+                    return True
+        except requests.exceptions.Timeout:
+            if retry_count < max_retries - 1:
+                status_placeholder.info(f"🔄 Timeout khi kết nối. Đang thử lại ({retry_count + 2}/{max_retries})...")
+                time.sleep(2)  # Đợi 2 giây trước khi thử lại
+            else:
+                status_placeholder.error(f"❌ Không thể kết nối đến API server tại {api_url}: Connection timeout")
+                return True
+        except requests.exceptions.ConnectionError:
+            if retry_count < max_retries - 1:
+                status_placeholder.info(f"🔄 Lỗi kết nối. Đang thử lại ({retry_count + 2}/{max_retries})...")
+                time.sleep(2)  # Đợi 2 giây trước khi thử lại
+            else:
+                status_placeholder.error(f"❌ Không thể kết nối đến API server tại {api_url}: Connection refused")
+                return True
+        except requests.exceptions.RequestException as e:
+            if retry_count < max_retries - 1:
+                status_placeholder.info(f"🔄 Lỗi request. Đang thử lại ({retry_count + 2}/{max_retries})...")
+                time.sleep(2)  # Đợi 2 giây trước khi thử lại
+            else:
+                status_placeholder.error(f"❌ Lỗi khi kết nối đến API server: {str(e)}")
+                return True
+    
+    # Tiếp tục mà không có API - sẽ sử dụng mô hình local
+    return True
 
 def main():
     """

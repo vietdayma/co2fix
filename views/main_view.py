@@ -290,12 +290,39 @@ class MainView:
             features = self.generate_random_features()
             st.info("Mỗi request sẽ sử dụng một bộ tham số ngẫu nhiên khác nhau")
             st.write("Ví dụ tham số ngẫu nhiên:", features)
+            
+        # Tùy chọn cho warm-up API (mặc định checked)
+        do_warmup = st.checkbox("Khởi động API trước khi benchmark (khuyên dùng)", value=True)
         
         # Nút kích hoạt quá trình benchmark
         if st.button("Chạy Benchmark"):
             # Tạo container cho log và thanh tiến trình
             log_container = st.empty()
             progress_bar = st.progress(0)
+            
+            # Khởi động API trước khi benchmark nếu được chọn
+            if do_warmup:
+                log_container.info("Đang khởi động API server (warm-up)...")
+                try:
+                    # Gửi request health check với timeout dài hơn
+                    requests.get(f"{API_URL}/health", timeout=30)
+                    
+                    # Gửi một request dự đoán đơn lẻ để khởi tạo mô hình
+                    warm_up_response = requests.post(
+                        f"{API_URL}/predict",
+                        json=features,
+                        timeout=60  # Chờ lâu hơn cho request đầu tiên
+                    )
+                    
+                    if warm_up_response.status_code == 200:
+                        result = warm_up_response.json()
+                        log_container.success(f"API đã sẵn sàng! Kết quả warm-up: {result.get('prediction', 'N/A')} g/km")
+                        # Đợi thêm 2 giây để đảm bảo API hoàn toàn sẵn sàng
+                        time.sleep(2)
+                    else:
+                        log_container.warning("API trả về lỗi khi warm-up, tiếp tục benchmark với thận trọng.")
+                except Exception as e:
+                    log_container.warning(f"Không thể warm-up API: {str(e)}. Tiếp tục benchmark...")
             
             # Bắt đầu đo thời gian
             start_time = time.perf_counter()
@@ -310,9 +337,17 @@ class MainView:
             
             # Danh sách lưu kết quả chi tiết
             benchmark_results = []
+            
+            # Biến lưu trữ thông tin về first request để debug
+            first_request_info = None
 
             # Hàm thực hiện một request đến API
-            def make_request():
+            def make_request(request_number):
+                nonlocal first_request_info
+                
+                # Thiết lập timeout động: dài hơn cho request đầu tiên
+                timeout = 30 if request_number == 0 else 10
+                
                 try:
                     # Tạo tham số: cố định hoặc ngẫu nhiên tùy chế độ đã chọn
                     request_features = (
@@ -326,7 +361,7 @@ class MainView:
                     response = requests.post(
                         f"{API_URL}/predict",
                         json=request_features,
-                        timeout=5  # 5 seconds timeout
+                        timeout=timeout  # Timeout động
                     )
                     req_end_time = time.perf_counter()
                     total_time_ms = (req_end_time - req_start_time) * 1000  # ms
@@ -343,6 +378,7 @@ class MainView:
                         # Lưu thông tin chi tiết request
                         timing_data = {
                             'timestamp': pd.Timestamp.now(),
+                            'request_number': request_number,
                             'total_time': total_time_sec,  # Seconds
                             'network_time': network_time_sec,  # Seconds
                             'processing_time': processing_time_sec,  # Seconds
@@ -352,20 +388,21 @@ class MainView:
                         }
                         benchmark_results.append(timing_data)
                         
-                        # Debug thông tin request đầu tiên
-                        if completed_requests == 0:
-                            st.write("Debug - First request:", {
+                        # Lưu thông tin request đầu tiên cho debug
+                        if request_number == 0:
+                            first_request_info = {
                                 'features': request_features,
                                 'prediction': result['prediction'],
                                 'api_process_time': f"{processing_time_sec:.3f}s ({processing_time_ms}ms)",
                                 'total_time': f"{total_time_sec:.3f}s",
                                 'network_latency': f"{network_time_sec:.3f}s"
-                            })
+                            }
                         return True
                     else:
                         # Lưu thông tin về request thất bại
                         timing_data = {
                             'timestamp': pd.Timestamp.now(),
+                            'request_number': request_number,
                             'total_time': total_time_sec,  # Seconds
                             'network_time': 0,
                             'processing_time': 0,
@@ -375,14 +412,19 @@ class MainView:
                         }
                         benchmark_results.append(timing_data)
                         
-                        if completed_requests == 0:
-                            st.error(f"API Error: {response.text}")
+                        # Lưu thông tin lỗi request đầu tiên
+                        if request_number == 0:
+                            first_request_info = {
+                                'features': request_features,
+                                'error': f"HTTP Error: {response.text}"
+                            }
                         return False
                         
                 except Exception as e:
                     # Lưu thông tin về request lỗi
                     timing_data = {
                         'timestamp': pd.Timestamp.now(),
+                        'request_number': request_number,
                         'total_time': 0,
                         'network_time': 0,
                         'processing_time': 0,
@@ -392,35 +434,58 @@ class MainView:
                     }
                     benchmark_results.append(timing_data)
                     
-                    if completed_requests == 0:
-                        st.error(f"Request Error: {str(e)}")
+                    # Lưu thông tin lỗi request đầu tiên
+                    if request_number == 0:
+                        first_request_info = {
+                            'features': request_features,
+                            'error': f"Request Error: {str(e)}"
+                        }
                     return False
 
-            # Sử dụng ThreadPoolExecutor để gửi nhiều request đồng thời
+            # Sử dụng ThreadPoolExecutor với chiến lược phân đợt
             with ThreadPoolExecutor(max_workers=50) as executor:
-                # Gửi tất cả request
-                future_to_request = {
-                    executor.submit(make_request): i 
-                    for i in range(n_requests)
-                }
+                # Chia thành các batch để tránh quá tải server
+                batch_size = 100  # Mỗi đợt 100 request
                 
-                # Xử lý kết quả khi các request hoàn thành
-                for future in as_completed(future_to_request):
-                    completed_requests += 1
-                    if future.result():
-                        successful_requests += 1
+                # Xử lý từng batch một
+                for batch_start in range(0, n_requests, batch_size):
+                    batch_end = min(batch_start + batch_size, n_requests)
+                    batch_count = batch_end - batch_start
                     
-                    # Cập nhật thanh tiến trình
-                    progress = completed_requests / n_requests
-                    progress_bar.progress(progress)
+                    # Gửi batch requests
+                    future_to_request = {
+                        executor.submit(make_request, i): i 
+                        for i in range(batch_start, batch_end)
+                    }
                     
-                    # Cập nhật log mỗi 100 request
-                    if completed_requests % 100 == 0:
-                        current_time = time.perf_counter() - start_time
-                        log_container.text(
-                            f"Đã xử lý {completed_requests}/{n_requests} requests... "
-                            f"({current_time:.1f}s)"
-                        )
+                    # Xử lý kết quả khi các request trong batch hoàn thành
+                    for future in as_completed(future_to_request):
+                        completed_requests += 1
+                        if future.result():
+                            successful_requests += 1
+                        
+                        # Cập nhật thanh tiến trình
+                        progress = completed_requests / n_requests
+                        progress_bar.progress(progress)
+                        
+                        # Cập nhật log mỗi 50 request
+                        if completed_requests % 50 == 0 or completed_requests == n_requests:
+                            current_time = time.perf_counter() - start_time
+                            log_container.info(
+                                f"Đã xử lý {completed_requests}/{n_requests} requests... "
+                                f"({current_time:.1f}s), {successful_requests} thành công"
+                            )
+                    
+                    # Đợi một chút giữa các batch để tránh quá tải server
+                    if batch_end < n_requests:
+                        time.sleep(0.5)
+            
+            # Hiển thị thông tin request đầu tiên nếu có
+            if first_request_info:
+                if 'error' in first_request_info:
+                    st.error(f"Debug - First request error: {first_request_info['error']}")
+                else:
+                    st.write("Debug - First request:", first_request_info)
             
             # Kết thúc đo thời gian
             end_time = time.perf_counter()
