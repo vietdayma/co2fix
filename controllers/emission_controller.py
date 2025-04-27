@@ -6,14 +6,6 @@ import pandas as pd
 import requests
 import os
 import logging
-import sys
-
-# Thêm đường dẫn hiện tại vào sys.path để import từ các module của dự án
-current_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(current_dir)
-
-# Import hàm predict_with_api từ app
-from app import predict_with_api
 
 # Cấu hình logging để theo dõi quá trình thực thi
 logging.basicConfig(
@@ -61,20 +53,15 @@ class EmissionController:
         return self.model.predict(features)
 
     def predict_emission_api(self, features):
-        """
-        Dự đoán khí thải sử dụng API và trả về phản hồi đầy đủ bao gồm thời gian xử lý
-        
-        Parameters:
-            features (dict): Các đặc trưng của xe cần dự đoán
-            
-        Returns:
-            dict: Phản hồi đầy đủ từ API
-        """
+        """Dự đoán khí thải sử dụng API và trả về phản hồi đầy đủ bao gồm thời gian xử lý"""
         try:
-            # Luôn vô hiệu hóa cache để đảm bảo request được gửi đến API
-            # và xuất hiện trong log API
-            return predict_with_api(features, disable_cache=True)
-        except Exception as e:
+            # Gửi yêu cầu đến API
+            response = requests.post(self.api_url, json=features)
+            response.raise_for_status()
+            
+            # Trả về dữ liệu phản hồi đầy đủ
+            return response.json()
+        except requests.exceptions.RequestException as e:
             raise Exception(f"Yêu cầu API thất bại: {str(e)}")
 
     def get_feature_importance(self):

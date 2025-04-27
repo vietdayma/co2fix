@@ -83,19 +83,18 @@ def get_cache_key(features):
     except:
         return None
 
-def predict_with_api(features, disable_cache=False):
+def predict_with_api(features):
     """
     Thực hiện dự đoán sử dụng API bên ngoài với kiểm soát đồng thời
     
     Hàm này quản lý các request đến API, bao gồm:
-    - Kiểm tra cache trước khi gọi API (nếu không disable_cache)
+    - Kiểm tra cache trước khi gọi API
     - Kiểm soát số lượng request đồng thời với semaphore
     - Xử lý các trường hợp lỗi và timeout
     - Lưu kết quả vào cache
     
     Parameters:
         features (dict): Các đặc trưng của xe cần dự đoán
-        disable_cache (bool): Nếu True, bỏ qua cache và luôn gọi API
         
     Returns:
         dict: Kết quả dự đoán từ API hoặc giá trị dự phòng
@@ -103,11 +102,10 @@ def predict_with_api(features, disable_cache=False):
     # Tạo cache key trước
     cache_key = get_cache_key(features)
     
-    # Kiểm tra cache trước tiên (nếu không disable_cache)
-    if not disable_cache:
-        with cache_lock:
-            if cache_key in prediction_cache:
-                return prediction_cache[cache_key]
+    # Kiểm tra cache trước tiên
+    with cache_lock:
+        if cache_key in prediction_cache:
+            return prediction_cache[cache_key]
     
     # Cơ chế dự phòng khi không thể gửi request
     try:
@@ -145,11 +143,10 @@ def predict_with_api(features, disable_cache=False):
             response.raise_for_status()
             result = response.json()
             
-            # Lưu kết quả vào cache (nếu không disable_cache)
-            if not disable_cache:
-                with cache_lock:
-                    if len(prediction_cache) < MAX_CACHE_SIZE:
-                        prediction_cache[cache_key] = result
+            # Lưu kết quả vào cache
+            with cache_lock:
+                if len(prediction_cache) < MAX_CACHE_SIZE:
+                    prediction_cache[cache_key] = result
             
             return result
         except requests.exceptions.Timeout:

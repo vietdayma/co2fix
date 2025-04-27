@@ -121,17 +121,13 @@ class MainView:
 
             try:
                 # Thực hiện dự đoán và lấy các thông tin liên quan
-                prediction_result = self.controller.predict_emission_api(features)
-                prediction = prediction_result['prediction']
+                prediction = self.controller.predict_emission(features)
                 avg_emission = self.controller.get_average_emission()
                 rating = self.controller.get_emission_rating(prediction)
                 tips = self.controller.get_eco_tips(prediction)
 
                 # Hiển thị kết quả
                 st.markdown("### 📊 Results")
-                # Thêm thông tin về API để debug
-                st.info(f"API response: status={prediction_result.get('status', 'unknown')}, process_time={prediction_result.get('process_time_ms', 0)}ms, cached={prediction_result.get('cached', False)}")
-                
                 col1, col2, col3 = st.columns(3)
                 
                 # Cột 1: Kết quả dự đoán CO2
