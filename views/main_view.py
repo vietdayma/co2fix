@@ -292,7 +292,7 @@ class MainView:
             st.write("Ví dụ tham số ngẫu nhiên:", features)
             
         # Tùy chọn cho warm-up API (mặc định checked)
-        do_warmup = st.checkbox("Khởi động API trước khi benchmark (khuyên dùng)", value=True)
+        do_warmup = st.checkbox("Khởi động API trước khi benchmark", value=True)
         
         # Nút kích hoạt quá trình benchmark
         if st.button("Chạy Benchmark"):
@@ -481,11 +481,11 @@ class MainView:
                         time.sleep(0.5)
             
             # Hiển thị thông tin request đầu tiên nếu có
-            if first_request_info:
+            """if first_request_info:
                 if 'error' in first_request_info:
                     st.error(f"Debug - First request error: {first_request_info['error']}")
                 else:
-                    st.write("Debug - First request:", first_request_info)
+                    st.write("Debug - First request:", first_request_info)"""
             
             # Kết thúc đo thời gian
             end_time = time.perf_counter()
